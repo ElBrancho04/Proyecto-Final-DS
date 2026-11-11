@@ -1,0 +1,21 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# --- Secretos (§18) ---
+.env
+!.env.example
+
+# --- Datos locales de agentes (identity.json, §7.2) ---
+data/
+
+# --- Editores / SO ---
+.vscode/
+.idea/
+.DS_Store
