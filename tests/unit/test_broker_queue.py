@@ -12,8 +12,8 @@ async def test_broker_at_least_once_and_dlq():
         pytest.skip("El actor 'broker' de Ray no está disponible en este clúster.")
 
     queue = "cap.math.add"
-    
-    # Crear un sobre de prueba con el formato estándar del proyecto
+
+    # Crear un sobre de prueba
     envelope = create_envelope(
         sender_id="agent-client",
         recipient_id="broker",
@@ -31,7 +31,7 @@ async def test_broker_at_least_once_and_dlq():
     assert msg_consumed is not None, "El broker debería retornar un mensaje pendiente."
     assert msg_consumed["attempts"] == 0, "El número inicial de intentos debe ser 0."
     assert msg_consumed["envelope"]["message_id"] == message_id
-    
+
     delivery_id = msg_consumed["delivery_id"]
 
     # Intentar consumir nuevamente de inmediato debe retornar None (está en vuelo / IN_FLIGHT)
@@ -40,7 +40,7 @@ async def test_broker_at_least_once_and_dlq():
 
     # 4. Simular fallo (nack) - Intento 1 -> Debería volver a PENDING con attempts = 1
     await broker.nack.remote(queue, delivery_id)
-    
+
     msg_retry_1 = await broker.consume.remote(queue)
     assert msg_retry_1 is not None
     assert msg_retry_1["attempts"] == 1, "El número de intentos debe incrementarse a 1 tras el primer nack."
@@ -63,6 +63,6 @@ async def test_broker_at_least_once_and_dlq():
     # 7. Verificar estadísticas o la existencia del mensaje en la DLQ (`dlq.math.add`)
     stats = await broker.stats.remote()
     dlq_queue = "dlq.math.add"
-    
+
     # Comprobamos que la DLQ registra actividad o mensajes en estado DLQ
     assert dlq_queue in stats or any("dlq" in q for q in stats.keys()), "El mensaje debe ser redirigido a la Dead Letter Queue (DLQ)."

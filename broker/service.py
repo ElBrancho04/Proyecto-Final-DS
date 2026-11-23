@@ -57,7 +57,7 @@ class BrokerService:
             log_event("MESSAGE_ACK_FAILED", "broker", queue=queue, delivery_id=delivery_id)
 
     async def nack(self, queue: str, delivery_id: str) -> None:
-        """Rechaza un mensaje: incrementa intentos, reencola o mueve a DLQ si excede el límite[cite: 1, 2]."""
+        """Rechaza un mensaje: incrementa intentos, reencola o mueve a DLQ si excede el límite."""
         success = self.store.nack(queue, delivery_id)
         if success:
             log_event("MESSAGE_NACKED", "broker", queue=queue, delivery_id=delivery_id)
@@ -65,11 +65,11 @@ class BrokerService:
             log_event("MESSAGE_NACK_FAILED", "broker", queue=queue, delivery_id=delivery_id)
 
     async def stats(self) -> Dict[str, Any]:
-        """Obtiene las estadísticas actuales de las colas y estados de mensajes[cite: 2]."""
+        """Obtiene las estadísticas actuales de las colas y estados de mensajes."""
         return self.store.get_stats()
 
     async def list_messages(self, limit: int = 50, queue: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Lista los mensajes almacenados para fines de auditoría y depuración[cite: 2]."""
+        """Lista los mensajes almacenados para fines de auditoría y depuración."""
         return self.store.list_messages(limit=limit, queue=queue)
 
     async def health(self) -> Dict[str, Any]:

@@ -19,7 +19,7 @@ from orchestrator.workflows import resolve_steps
 
 class OrchestratorService:
     """
-    Núcleo del Orquestador (B3): gestiona tareas, pasos e historial append-only en SQLite.
+    Núcleo del Orquestador: gestiona tareas, pasos e historial append-only en SQLite.
     Todo el estado vive en SQLite; el servicio es stateless respecto al estado de las tareas.
     """
 
@@ -120,8 +120,8 @@ class OrchestratorService:
         step_executor: Optional[Callable[[str, Dict[str, Any], Dict[str, Any]], Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Avanza el siguiente paso pendiente de una tarea contra fakes o un ejecutor provisto,
-        persistiendo estado, salidas y eventos append-only en SQLite.
+        Avanza el siguiente paso pendiente de una tarea, persistiendo estado, salidas y
+        eventos append-only en SQLite.
         """
         task = self.store.get_task(task_id)
         if task["state"] in TERMINAL_TASK_STATES:
@@ -272,7 +272,7 @@ class OrchestratorService:
                 event_type="TASK_FAILED",
                 event_payload={"task_id": task_id, "step_id": step_id, "error": str(exc)},
             )
-        
+
     async def run_task_with_fakes(
         self,
         task_id: str,

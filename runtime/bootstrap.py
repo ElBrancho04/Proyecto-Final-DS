@@ -13,9 +13,9 @@ class EmptyActor:
 def start_platform() -> None:
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True)
-    
+
     log_event("START_PLATFORM", "bootstrap")
-    
+
     # Inicializar el Broker real
     try:
         broker_actor = ray.get_actor("broker", namespace=RAY_NAMESPACE)
@@ -26,7 +26,7 @@ def start_platform() -> None:
         ray.get(broker_actor.start.remote())
         log_event("ACTOR_CREATED", "bootstrap", actor_name="broker")
 
-    # Inicializar los demás actores restantes (como EmptyActor por ahora)
+    # Inicializar el resto de los actores (EmptyActor por ahora)
     other_actors = ["identity", "registry1", "registry2", "registry3", "orchestrator"]
     for name in other_actors:
         try:

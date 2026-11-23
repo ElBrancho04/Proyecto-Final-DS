@@ -10,11 +10,11 @@ HandlerFunc = Callable[[str, Dict[str, Any], Dict[str, Any]], Awaitable[Dict[str
 
 
 class MessageBus:
-    """Bus de mensajería sobre BrokerService / BrokerClient con request/reply, reintentos e idempotencia[cite: 2]."""
+    """Bus de mensajería sobre BrokerService / BrokerClient con request/reply, reintentos e idempotencia."""
 
-    RETRY_BACKOFFS_S: Tuple[float, ...] = (0.1, 0.5, 2.0)  # 100 ms, 500 ms, 2 s[cite: 2]
-    IDEMPOTENCY_TTL_S: float = 300.0  # 5 minutos[cite: 2]
-    POLL_INTERVAL_S: float = 0.4  # 400 ms[cite: 2]
+    RETRY_BACKOFFS_S: Tuple[float, ...] = (0.1, 0.5, 2.0)  # 100 ms, 500 ms, 2 s
+    IDEMPOTENCY_TTL_S: float = 300.0  # 5 minutos
+    POLL_INTERVAL_S: float = 0.4  # 400 ms
 
     def __init__(
         self,
@@ -96,7 +96,7 @@ class MessageBus:
         self._idempotency_cache[idempotency_key] = (now + self.IDEMPOTENCY_TTL_S, dict(reply_envelope))
 
     async def _poll_reply(self, reply_queue: str, correlation_id: str, deadline: float) -> Optional[Dict[str, Any]]:
-        """Consume mensajes de reply.{agent_id} buscando el que coincida con correlation_id[cite: 2]."""
+        """Consume mensajes de reply.{agent_id} buscando el que coincida con correlation_id."""
         while time.monotonic() < deadline:
             async with self._reply_condition:
                 if correlation_id in self._pending_replies:
@@ -137,7 +137,7 @@ class MessageBus:
         task_id: Optional[str] = None,
         step_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Envía un request a cap.{to_capability} y espera response/reject en reply.{agent_id} con reintentos[cite: 2]."""
+        """Envía un request a cap.{to_capability} y espera response/reject en reply.{agent_id} con reintentos."""
         effective_timeout = timeout_s if timeout_s is not None else self.default_timeout_s
         idem_key = idempotency_key or new_id()
         reply_queue = f"reply.{self.agent_id}"
@@ -357,7 +357,7 @@ class MessageBus:
         handler: HandlerFunc,
         max_concurrency: int = 10,
     ) -> None:
-        """Bucle de consumo cada 400 ms en cap.{capability_id} con control de concurrencia e idempotencia[cite: 2]."""
+        """Bucle de consumo cada 400 ms en cap.{capability_id} con control de concurrencia e idempotencia."""
         queue = f"cap.{capability_id}"
         active_tasks = set()
         self._stopping = False
@@ -386,7 +386,7 @@ class MessageBus:
                 await asyncio.gather(*active_tasks, return_exceptions=True)
 
     async def send_event(self, to_capability: str, name: str, data: Dict[str, Any]) -> None:
-        """Publica un mensaje de tipo event hacia cap.{to_capability} sin esperar respuesta[cite: 2]."""
+        """Publica un mensaje de tipo event hacia cap.{to_capability} sin esperar respuesta."""
         event_envelope = self._build_envelope(
             "event",
             {"name": name, "data": data},

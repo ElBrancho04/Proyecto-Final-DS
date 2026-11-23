@@ -18,7 +18,7 @@ class BrokerStore:
         return conn
 
     def _init_db(self) -> None:
-        """Inicializa la tabla broker_messages según la especificación del proyecto."""
+        """Inicializa la tabla broker_messages."""
         with self._get_connection() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS broker_messages (
@@ -175,7 +175,7 @@ class BrokerStore:
         return expired_count
 
     def get_stats(self) -> Dict[str, Any]:
-        """Obtiene estadísticas del estado de las colas y mensajes[cite: 2]."""
+        """Obtiene estadísticas del estado de las colas y mensajes."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -195,7 +195,7 @@ class BrokerStore:
             return stats
 
     def list_messages(self, limit: int = 50, queue: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Lista mensajes almacenados (útil para auditoría y depuración)[cite: 2]."""
+        """Lista mensajes almacenados (útil para auditoría y depuración)."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             if queue:

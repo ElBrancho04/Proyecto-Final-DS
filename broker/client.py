@@ -6,7 +6,7 @@ from common.errors import PlatformError
 
 
 class BrokerClient:
-    """Cliente de acceso al actor BrokerService de Ray con soporte async y utilidades síncronas[cite: 1]."""
+    """Cliente de acceso al actor BrokerService de Ray con soporte async y utilidades síncronas."""
 
     def __init__(self, actor_name: str = "broker", namespace: str = RAY_NAMESPACE, actor_handle: Any = None):
         self.actor_name = actor_name
@@ -14,7 +14,7 @@ class BrokerClient:
         self._actor = actor_handle
 
     def _get_actor(self):
-        """Resuelve el handle del actor del broker en Ray si aún no está en caché[cite: 1]."""
+        """Resuelve el handle del actor del broker en Ray si aún no está en caché."""
         if self._actor is not None:
             return self._actor
         if not ray.is_initialized():
@@ -56,31 +56,31 @@ class BrokerClient:
                     raise PlatformError("BROKER_RPC_ERROR", f"Error en '{method_name}': {exc}") from exc
 
     async def publish(self, queue: str, envelope: dict) -> str:
-        """Publica un envelope en la cola indicada y retorna el message_id[cite: 1]."""
+        """Publica un envelope en la cola indicada y retorna el message_id."""
         return await self._call_async("publish", queue, envelope)
 
     async def consume(self, queue: str) -> Optional[Dict[str, Any]]:
-        """Consume un mensaje pendiente de la cola indicada (o None si está vacía)[cite: 1]."""
+        """Consume un mensaje pendiente de la cola indicada (o None si está vacía)."""
         return await self._call_async("consume", queue)
 
     async def ack(self, queue: str, delivery_id: str) -> None:
-        """Confirma el procesamiento exitoso de un mensaje[cite: 1]."""
+        """Confirma el procesamiento exitoso de un mensaje."""
         await self._call_async("ack", queue, delivery_id)
 
     async def nack(self, queue: str, delivery_id: str) -> None:
-        """Rechaza un mensaje para reintento o envío a DLQ[cite: 1]."""
+        """Rechaza un mensaje para reintento o envío a DLQ."""
         await self._call_async("nack", queue, delivery_id)
 
     async def stats(self) -> Dict[str, Any]:
-        """Consulta las estadísticas de colas del broker[cite: 1]."""
+        """Consulta las estadísticas de colas del broker."""
         return await self._call_async("stats")
 
     async def list_messages(self, limit: int = 50, queue: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Lista mensajes almacenados en el broker[cite: 1]."""
+        """Lista mensajes almacenados en el broker."""
         return await self._call_async("list_messages", limit=limit, queue=queue)
 
     async def health(self) -> Dict[str, Any]:
-        """Verifica el estado de salud del broker[cite: 1]."""
+        """Verifica el estado de salud del broker."""
         return await self._call_async("health")
 
     # --- Variantes síncronas explícitas ---
