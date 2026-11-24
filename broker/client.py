@@ -1,6 +1,7 @@
 import asyncio
 from typing import Any, Dict, List, Optional
 import ray
+from common import ray_support
 from common.config import RAY_NAMESPACE
 from common.errors import PlatformError
 
@@ -17,10 +18,8 @@ class BrokerClient:
         """Resuelve el handle del actor del broker en Ray si aún no está en caché."""
         if self._actor is not None:
             return self._actor
-        if not ray.is_initialized():
-            ray.init(address="auto", ignore_reinit_error=True)
         try:
-            self._actor = ray.get_actor(self.actor_name, namespace=self.namespace)
+            self._actor = ray_support.get_handle(self.actor_name, self.namespace)
             return self._actor
         except Exception as exc:
             raise PlatformError("BROKER_UNAVAILABLE", f"No se pudo obtener el actor '{self.actor_name}': {exc}") from exc
@@ -28,6 +27,7 @@ class BrokerClient:
     def reset_handle(self) -> None:
         """Limpia el handle cacheado para forzar una nueva resolución ante fallos o reinicios."""
         self._actor = None
+        ray_support.reset_handle(self.actor_name, self.namespace)
 
     async def _call_async(self, method_name: str, *args, **kwargs) -> Any:
         """Ejecuta un método remoto del actor BrokerService de forma no bloqueante en asyncio."""
@@ -37,6 +37,8 @@ class BrokerClient:
             obj_ref = method.remote(*args, **kwargs)
             try:
                 return await asyncio.to_thread(ray.get, obj_ref)
+            except PlatformError:
+                raise
             except Exception as exc:
                 self.reset_handle()
                 if attempt == 1:
@@ -50,6 +52,8 @@ class BrokerClient:
             obj_ref = method.remote(*args, **kwargs)
             try:
                 return ray.get(obj_ref)
+            except PlatformError:
+                raise
             except Exception as exc:
                 self.reset_handle()
                 if attempt == 1:

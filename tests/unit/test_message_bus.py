@@ -7,59 +7,27 @@ from sdk.messaging import MessageBus
 
 
 class InMemoryAsyncBroker:
-    """Adaptador asíncrono sobre BrokerStore usando una conexión persistente para pruebas unitarias."""
+    """Adaptador asíncrono sobre BrokerStore.
+
+    Con db_path=':memory:' el store mantiene internamente una conexión persistente,
+    por lo que todas las operaciones ven la misma base de datos.
+    """
 
     def __init__(self, visibility_timeout: int = 30, max_attempts: int = 3) -> None:
         self._store = BrokerStore(db_path=":memory:")
-        self._conn = self._store._get_connection()
-        self._init_memory_schema()
         self._visibility_timeout = visibility_timeout
         self._max_attempts = max_attempts
 
-    def _init_memory_schema(self) -> None:
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS broker_messages (
-                message_id TEXT PRIMARY KEY,
-                queue TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                status TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                delivery_id TEXT,
-                visible_at REAL,
-                created_at REAL NOT NULL
-            )
-            """
-        )
-        self._conn.commit()
-
-    def _override_conn(self):
-        class _Ctx:
-            def __init__(self, conn):
-                self._conn = conn
-
-            def __enter__(self):
-                return self._conn
-
-            def __exit__(self, exc_type, exc_val, exc_tb):
-                return False
-
-        return _Ctx(self._conn)
-
     async def publish(self, queue: str, envelope: dict) -> str:
-        self._store._get_connection = self._override_conn
         return self._store.publish(queue, envelope)
 
     async def consume(self, queue: str):
-        self._store._get_connection = self._override_conn
         return self._store.consume(queue, visibility_timeout=self._visibility_timeout)
 
     async def ack(self, queue: str, delivery_id: str) -> None:
-        self._store._get_connection = self._override_conn
         self._store.ack(queue, delivery_id)
 
     async def nack(self, queue: str, delivery_id: str) -> None:
-        self._store._get_connection = self._override_conn
         self._store.nack(queue, delivery_id)
 
 
@@ -108,8 +76,8 @@ async def test_message_bus_retries_with_same_idempotency_key():
     server_task = asyncio.create_task(server_bus.serve("work.flaky", flaky_handler, max_concurrency=5))
     try:
         fixed_idem = "idem-fixed-123"
-        # Al ser una Reject con retryable=True y misma idempotency_key, reintenta con backoff
-        # y el servidor devuelve la respuesta cacheada para esa clave (sin re-ejecutar el handler).
+        # El reject (aun siendo retryable) se retorna tal cual al llamador con la misma
+        # idempotency_key: el handler NO se re-ejecuta; quien decide reintentar es la capa superior.
         reply = await client_bus.send_request(
             "work.flaky",
             {"value": 42},

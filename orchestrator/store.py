@@ -57,6 +57,7 @@ class OrchestratorStore:
                     attempt INTEGER NOT NULL DEFAULT 0,
                     idempotency_key TEXT NOT NULL,
                     input_json TEXT NOT NULL,
+                    input_map_json TEXT,
                     output_json TEXT,
                     error_json TEXT,
                     created_at TEXT NOT NULL,
@@ -65,6 +66,9 @@ class OrchestratorStore:
                 )
                 """
             )
+            step_columns = [r["name"] for r in conn.execute("PRAGMA table_info(task_steps)").fetchall()]
+            if "input_map_json" not in step_columns:
+                conn.execute("ALTER TABLE task_steps ADD COLUMN input_map_json TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS task_events (
@@ -125,6 +129,7 @@ class OrchestratorStore:
             "attempt": row["attempt"],
             "idempotency_key": row["idempotency_key"],
             "input": self._decode_json(row["input_json"], {}),
+            "input_map": self._decode_json(row["input_map_json"], None),
             "output": self._decode_json(row["output_json"], None),
             "error": self._decode_json(row["error_json"], None),
             "created_at": row["created_at"],
@@ -213,10 +218,10 @@ class OrchestratorStore:
                     """
                     INSERT INTO task_steps (
                         step_id, task_id, step_index, capability_id, state,
-                        attempt, idempotency_key, input_json, output_json, error_json,
+                        attempt, idempotency_key, input_json, input_map_json, output_json, error_json,
                         created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, NULL, ?, ?)
                     """,
                     (
                         step_id,
@@ -226,6 +231,7 @@ class OrchestratorStore:
                         StepState.PENDING.value,
                         idem_key,
                         json.dumps(step_input),
+                        self._encode_json(spec.get("input_map")),
                         now,
                         now,
                     ),
