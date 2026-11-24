@@ -1,3 +1,4 @@
+import os
 import ray
 import asyncio
 from typing import Optional, Dict, Any, List
@@ -58,7 +59,7 @@ class BrokerService:
 
     async def nack(self, queue: str, delivery_id: str) -> None:
         """Rechaza un mensaje: incrementa intentos, reencola o mueve a DLQ si excede el límite."""
-        success = self.store.nack(queue, delivery_id)
+        success = self.store.nack(queue, delivery_id, max_attempts=self.max_attempts)
         if success:
             log_event("MESSAGE_NACKED", "broker", queue=queue, delivery_id=delivery_id)
         else:
@@ -74,11 +75,12 @@ class BrokerService:
 
     async def health(self) -> Dict[str, Any]:
         """Devuelve el estado de salud del actor del broker."""
+        info = {"pid": os.getpid(), "node_id": ray.get_runtime_context().get_node_id()}
         try:
             stats = self.store.get_stats()
-            return {"status": "healthy", "service": "broker", "stats": stats}
+            return {"status": "healthy", "service": "broker", **info, "stats": stats}
         except Exception as e:
-            return {"status": "unhealthy", "service": "broker", "error": str(e)}
+            return {"status": "unhealthy", "service": "broker", **info, "error": str(e)}
 
     async def _reaper_loop(self) -> None:
         """Bucle periódico que ejecuta el reaper cada 2 segundos para liberar mensajes expirados."""

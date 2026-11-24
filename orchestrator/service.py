@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Any, Callable, Dict, List, Optional
 import ray
 
@@ -14,7 +15,7 @@ from orchestrator.state_machine import (
     transition_task,
 )
 from orchestrator.store import OrchestratorStore
-from orchestrator.workflows import resolve_steps
+from orchestrator.workflows import resolve_input_map, resolve_steps
 
 
 class OrchestratorService:
@@ -102,11 +103,39 @@ class OrchestratorService:
             task_id=task_id,
         )
 
+    async def recover_pending_tasks(self) -> List[str]:
+        """
+        Recuperación al arrancar: los pasos que quedaron RUNNING vuelven a PENDING (misma idempotency_key)
+        y se devuelven los ids de las tareas no terminales que deben reanudarse.
+        """
+        resumable: List[str] = []
+        for task in self.store.list_tasks():
+            if task["state"] in TERMINAL_TASK_STATES:
+                continue
+            for step in task["steps"]:
+                if step["state"] == StepState.RUNNING.value:
+                    transition_step(step, StepState.PENDING.value)
+                    self.store.update_step(
+                        step["step_id"],
+                        state=StepState.PENDING.value,
+                        event_task_id=task["task_id"],
+                        event_type="STEP_REASSIGNED",
+                        event_payload={
+                            "step_id": step["step_id"],
+                            "capability_id": step["capability_id"],
+                            "attempt": step["attempt"],
+                            "idempotency_key": step["idempotency_key"],
+                            "reason": "recovery",
+                        },
+                    )
+            resumable.append(task["task_id"])
+        return resumable
+
     async def _discover_capability(self, capability_id: str) -> List[Any]:
         """Consulta el registro (o FakeRegistry) para descubrir instancias de una capacidad."""
         if self.registry is None:
             return []
-        query = DiscoverQuery(capability_id=capability_id)
+        query = DiscoverQuery(capability=capability_id)
         if hasattr(self.registry, "discover"):
             res = self.registry.discover(query)
             if asyncio.iscoroutine(res):
@@ -193,15 +222,20 @@ class OrchestratorService:
             self.store.update_step(step_id, input_data=step_input)
 
         try:
+            if current_step.get("input_map"):
+                step_input = resolve_input_map(
+                    current_step["input_map"],
+                    task_now["input"],
+                    [s["output"] for s in task_now["steps"]],
+                )
+                self.store.update_step(step_id, input_data=step_input)
+
             if step_executor is not None:
                 raw_result = step_executor(capability_id, step_input, current_step)
                 step_output = await raw_result if asyncio.iscoroutine(raw_result) else raw_result
             else:
-                step_output = {
-                    "capability_id": capability_id,
-                    "input": step_input,
-                    "matched_agent_id": getattr(selected_match, "agent_id", None),
-                }
+                # Nunca se marca un paso como DONE sin respuesta real de un agente
+                raise PlatformError("EXECUTOR_NOT_CONFIGURED", "No hay ejecutor de pasos configurado")
 
             transition_step(current_step, StepState.DONE.value, {"output": step_output})
             self.store.update_step(
@@ -239,7 +273,8 @@ class OrchestratorService:
 
         except Exception as exc:
             err_info = {"error": str(exc), "attempt": attempt}
-            if attempt < self.MAX_STEP_ATTEMPTS:
+            non_retryable = isinstance(exc, PlatformError) and exc.code == "VALIDATION_ERROR"
+            if attempt < self.MAX_STEP_ATTEMPTS and not non_retryable:
                 transition_step(current_step, StepState.PENDING.value)
                 self.store.update_step(
                     step_id,
@@ -298,11 +333,18 @@ class OrchestratorService:
 class OrchestratorActor:
     """Actor de Ray para el Orquestador."""
 
-    def __init__(self, db_path: str = "data/orchestrator.db") -> None:
-        self._service = OrchestratorService(db_path=db_path)
+    def __init__(self, db_path: str = "data/orchestrator.db", registry: Any = None, broker: Any = None) -> None:
+        self._service = OrchestratorService(db_path=db_path, registry=registry, broker=broker)
+
+    async def start(self) -> List[str]:
+        return await self._service.recover_pending_tasks()
 
     async def health(self) -> Dict[str, Any]:
-        return await self._service.health()
+        return {
+            **await self._service.health(),
+            "pid": os.getpid(),
+            "node_id": ray.get_runtime_context().get_node_id(),
+        }
 
     async def create_task(
         self,

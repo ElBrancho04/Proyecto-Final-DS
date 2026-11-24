@@ -5,15 +5,36 @@ from common.ids import new_id, now_iso
 
 class RejectCode(str, Enum):
     OVERLOADED = "OVERLOADED"
-    INVALID_PAYLOAD = "INVALID_PAYLOAD"
-    UNAUTHORIZED = "UNAUTHORIZED"
-    NOT_FOUND = "NOT_FOUND"
     INTERNAL_ERROR = "INTERNAL_ERROR"
     NOT_COMPETENT = "NOT_COMPETENT"
     UNAVAILABLE = "UNAVAILABLE"
     VALIDATION_ERROR = "VALIDATION_ERROR"
+    INVALID_PAYLOAD = "INVALID_PAYLOAD"
+    UNAUTHORIZED = "UNAUTHORIZED"
+    NOT_FOUND = "NOT_FOUND"
     CANCELLED = "CANCELLED"
     TIMEOUT = "TIMEOUT"
+
+
+# Reintento por defecto de cada código (roadmap, sección 5.3)
+DEFAULT_RETRYABLE: Dict[str, bool] = {
+    RejectCode.NOT_COMPETENT.value: False,
+    RejectCode.OVERLOADED.value: True,
+    RejectCode.UNAVAILABLE.value: True,
+    RejectCode.VALIDATION_ERROR.value: False,
+    RejectCode.INVALID_PAYLOAD.value: False,
+    RejectCode.UNAUTHORIZED.value: False,
+    RejectCode.NOT_FOUND.value: False,
+    RejectCode.CANCELLED.value: False,
+    RejectCode.TIMEOUT.value: True,
+    RejectCode.INTERNAL_ERROR.value: False,
+}
+
+ENVELOPE_FIELDS = (
+    "v", "message_id", "correlation_id", "idempotency_key", "type", "from_agent_id",
+    "to_capability", "reply_to", "task_id", "step_id", "timeout_ms", "timestamp", "payload",
+)
+ENVELOPE_TYPES = ("request", "response", "reject", "event")
 
 
 def create_envelope(
@@ -55,10 +76,7 @@ def create_envelope(
         "correlation_id": resolved_corr,
         "idempotency_key": resolved_idem,
         "type": resolved_type,
-        "msg_type": resolved_type,
         "from_agent_id": resolved_from,
-        "sender_id": resolved_from,
-        "recipient_id": resolved_to_cap,
         "to_capability": resolved_to_cap,
         "reply_to": reply_to,
         "task_id": task_id,
@@ -67,3 +85,23 @@ def create_envelope(
         "timestamp": now_iso(),
         "payload": resolved_payload,
     }
+
+
+def validate_envelope(envelope: Dict[str, Any]) -> None:
+    """Valida que un mensaje cumpla el Envelope v1 (roadmap, sección 5.1); lanza PlatformError VALIDATION_ERROR."""
+    from common.errors import PlatformError  # import diferido: errors.py importa este módulo
+
+    if not isinstance(envelope, dict):
+        raise PlatformError("VALIDATION_ERROR", "El envelope debe ser un diccionario")
+    missing = [f for f in ENVELOPE_FIELDS if f not in envelope]
+    extra = [f for f in envelope if f not in ENVELOPE_FIELDS]
+    if missing or extra:
+        raise PlatformError("VALIDATION_ERROR", f"Campos faltantes: {missing}; campos no permitidos: {extra}")
+    if envelope["v"] != 1:
+        raise PlatformError("VALIDATION_ERROR", f"Versión de envelope no soportada: {envelope['v']}")
+    if envelope["type"] not in ENVELOPE_TYPES:
+        raise PlatformError("VALIDATION_ERROR", f"Tipo de envelope inválido: {envelope['type']}")
+    if envelope["type"] in ("request", "event") and not envelope["to_capability"]:
+        raise PlatformError("VALIDATION_ERROR", "request/event requieren to_capability")
+    if not isinstance(envelope["payload"], dict):
+        raise PlatformError("VALIDATION_ERROR", "payload debe ser un objeto")

@@ -1,18 +1,20 @@
+import os
 import ray
-import time
 from typing import Dict, Any
 from common.config import RAY_NAMESPACE
 from common.logging import log_event
+from common.ray_support import connect
+from broker.client import BrokerClient
 from broker.service import BrokerService
+from orchestrator.service import OrchestratorActor
 
 @ray.remote
 class EmptyActor:
     def health(self) -> Dict[str, Any]:
-        return {"status": "healthy"}
+        return {"status": "healthy", "pid": os.getpid(), "node_id": ray.get_runtime_context().get_node_id()}
 
 def start_platform() -> None:
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True)
+    connect()
 
     log_event("START_PLATFORM", "bootstrap")
 
@@ -26,8 +28,18 @@ def start_platform() -> None:
         ray.get(broker_actor.start.remote())
         log_event("ACTOR_CREATED", "bootstrap", actor_name="broker")
 
+    # Inicializar el Orquestador real (el registro se conecta cuando exista RegistryClient)
+    try:
+        ray.get_actor("orchestrator", namespace=RAY_NAMESPACE)
+        log_event("ACTOR_ALREADY_EXISTS", "bootstrap", actor_name="orchestrator")
+    except ValueError:
+        orchestrator_actor = OrchestratorActor.options(name="orchestrator", namespace=RAY_NAMESPACE, lifetime="detached").remote(broker=BrokerClient())
+        # Recuperar pasos RUNNING que quedaron de una ejecución anterior
+        ray.get(orchestrator_actor.start.remote())
+        log_event("ACTOR_CREATED", "bootstrap", actor_name="orchestrator")
+
     # Inicializar el resto de los actores (EmptyActor por ahora)
-    other_actors = ["identity", "registry1", "registry2", "registry3", "orchestrator"]
+    other_actors = ["identity", "registry1", "registry2", "registry3"]
     for name in other_actors:
         try:
             ray.get_actor(name, namespace=RAY_NAMESPACE)
@@ -38,7 +50,12 @@ def start_platform() -> None:
 
 def stop_platform() -> None:
     log_event("STOP_PLATFORM", "bootstrap")
-    actors = ["identity", "registry1", "registry2", "registry3", "broker", "orchestrator"]
+    try:
+        connect()
+    except Exception as exc:
+        log_event("STOP_PLATFORM_NO_CLUSTER", "bootstrap", error=str(exc))
+        return
+    actors =["identity", "registry1", "registry2", "registry3", "broker", "orchestrator"]
     for name in actors:
         try:
             actor = ray.get_actor(name, namespace=RAY_NAMESPACE)
@@ -58,8 +75,3 @@ def stop_platform() -> None:
 if __name__ == "__main__":
     start_platform()
     print("Plataforma levantada con éxito en Ray.")
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        stop_platform()

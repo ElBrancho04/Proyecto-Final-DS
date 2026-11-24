@@ -2,20 +2,31 @@ import sqlite3
 import json
 import os
 import time
+from contextlib import closing
 from typing import Optional, Dict, Any, List
 from common.ids import new_id
 
 class BrokerStore:
     def __init__(self, db_path: str = "data/broker.db"):
         self.db_path = db_path
-        # Asegurar que el directorio data/ exista
-        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        if db_path != ":memory:":
+            # Asegurar que el directorio data/ exista
+            os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        # Con ':memory:' se requiere UNA única conexión persistente: cada llamada a
+        # sqlite3.connect(':memory:') crearía una base de datos vacía distinta.
+        self._persistent_conn: Optional[sqlite3.Connection] = None
+        if db_path == ":memory:":
+            self._persistent_conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._persistent_conn.row_factory = sqlite3.Row
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    def _get_connection(self):
+        """Retorna la conexión persistente (caso ':memory:') o una conexión efímera envuelta en closing()."""
+        if self._persistent_conn is not None:
+            return self._persistent_conn
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        return closing(conn)  # `with` cierra la conexión (sqlite3 solo hace commit/rollback)
 
     def _init_db(self) -> None:
         """Inicializa la tabla broker_messages."""
@@ -102,7 +113,7 @@ class BrokerStore:
             conn.commit()
             return cursor.rowcount > 0
 
-    def nack(self, queue: str, delivery_id: str) -> bool:
+    def nack(self, queue: str, delivery_id: str, max_attempts: int = 3) -> bool:
         """Rechaza un mensaje: incrementa intentos, lo devuelve a PENDING o lo mueve a DLQ si excede o iguala el límite."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -119,8 +130,8 @@ class BrokerStore:
             attempts = row["attempts"] + 1
             payload = json.loads(row["payload"])
 
-            if attempts >= 3:
-                capability_id = payload.get("to_capability", "unknown")
+            if attempts >= max_attempts:
+                capability_id = payload.get("to_capability") or "unknown"
                 dlq_queue = f"dlq.{capability_id}"
                 cursor.execute("""
                     UPDATE broker_messages
@@ -156,7 +167,7 @@ class BrokerStore:
                 payload = json.loads(row["payload"])
 
                 if attempts >= max_attempts:
-                    capability_id = payload.get("to_capability", "unknown")
+                    capability_id = payload.get("to_capability") or "unknown"
                     dlq_queue = f"dlq.{capability_id}"
                     cursor.execute("""
                         UPDATE broker_messages

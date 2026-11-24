@@ -2,9 +2,9 @@ import asyncio
 import time
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 from common.errors import PlatformError, Reject
-from common.ids import new_id, now_iso
+from common.ids import new_id
 from common.logging import log_event
-from common.messages import RejectCode
+from common.messages import RejectCode, create_envelope
 
 HandlerFunc = Callable[[str, Dict[str, Any], Dict[str, Any]], Awaitable[Dict[str, Any]]]
 
@@ -15,6 +15,7 @@ class MessageBus:
     RETRY_BACKOFFS_S: Tuple[float, ...] = (0.1, 0.5, 2.0)  # 100 ms, 500 ms, 2 s
     IDEMPOTENCY_TTL_S: float = 300.0  # 5 minutos
     POLL_INTERVAL_S: float = 0.4  # 400 ms
+    PENDING_REPLY_TTL_S: float = 60.0  # respuestas no reclamadas expiran
 
     def __init__(
         self,
@@ -32,7 +33,9 @@ class MessageBus:
         # Caché de respuestas/rechazos por idempotency_key: key -> (expires_at, response_envelope)
         self._idempotency_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         # Respuestas recibidas en reply.{agent_id} indexadas por correlation_id
-        self._pending_replies: Dict[str, Dict[str, Any]] = {}
+        self._pending_replies: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        # Ejecuciones en curso por idempotency_key: una reentrega espera este resultado en vez de ejecutar de nuevo
+        self._in_progress: Dict[str, asyncio.Future] = {}
         self._reply_condition = asyncio.Condition()
         self._in_flight: int = 0
         self._stopping: bool = False
@@ -51,22 +54,25 @@ class MessageBus:
         step_id: Optional[str] = None,
         timeout_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
-        message_id = new_id()
-        return {
-            "v": 1,
-            "message_id": message_id,
-            "correlation_id": correlation_id or message_id,
-            "idempotency_key": idempotency_key or new_id(),
-            "type": msg_type,
-            "from_agent_id": from_agent_id or self.agent_id,
-            "to_capability": to_capability,
-            "reply_to": reply_to,
-            "task_id": task_id,
-            "step_id": step_id,
-            "timeout_ms": timeout_ms,
-            "timestamp": now_iso(),
-            "payload": payload,
-        }
+        return create_envelope(
+            envelope_type=msg_type,
+            payload=payload,
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key,
+            from_agent_id=from_agent_id or self.agent_id,
+            to_capability=to_capability,
+            reply_to=reply_to,
+            task_id=task_id,
+            step_id=step_id,
+            timeout_ms=timeout_ms,
+        )
+
+    def _cleanup_pending_replies(self) -> None:
+        now = time.monotonic()
+        expired_keys = [k for k, (exp, _) in self._pending_replies.items() if exp <= now]
+        for key in expired_keys:
+            del self._pending_replies[key]
+            log_event("STALE_REPLY", f"bus:{self.agent_id}", correlation_id=key)
 
     def _cleanup_idempotency_cache(self, now: Optional[float] = None) -> None:
         current = now if now is not None else time.monotonic()
@@ -98,9 +104,10 @@ class MessageBus:
     async def _poll_reply(self, reply_queue: str, correlation_id: str, deadline: float) -> Optional[Dict[str, Any]]:
         """Consume mensajes de reply.{agent_id} buscando el que coincida con correlation_id."""
         while time.monotonic() < deadline:
+            self._cleanup_pending_replies()
             async with self._reply_condition:
                 if correlation_id in self._pending_replies:
-                    return self._pending_replies.pop(correlation_id)
+                    return self._pending_replies.pop(correlation_id)[1]
 
             item = await self.broker.consume(reply_queue)
             if item is not None:
@@ -116,7 +123,7 @@ class MessageBus:
 
                 if msg_corr_id:
                     async with self._reply_condition:
-                        self._pending_replies[msg_corr_id] = envelope
+                        self._pending_replies[msg_corr_id] = (time.monotonic() + self.PENDING_REPLY_TTL_S, envelope)
                         self._reply_condition.notify_all()
                 continue
 
@@ -136,15 +143,23 @@ class MessageBus:
         idempotency_key: Optional[str] = None,
         task_id: Optional[str] = None,
         step_id: Optional[str] = None,
+        max_retries: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Envía un request a cap.{to_capability} y espera response/reject en reply.{agent_id} con reintentos."""
+        """Envía un request a cap.{to_capability} y espera response/reject en reply.{agent_id}.
+
+        Los reintentos automáticos (backoff creciente, misma idempotency_key) aplican solo
+        cuando no llega respuesta (timeout). Los rejects se devuelven tal cual al llamador,
+        dejando la decisión de reintentar a la capa superior (p. ej. el orquestador).
+        max_retries sobrescribe el valor del bus (max_retries=0 desactiva los reintentos).
+        """
+        retries = self.max_retries if max_retries is None else max_retries
         effective_timeout = timeout_s if timeout_s is not None else self.default_timeout_s
         idem_key = idempotency_key or new_id()
         reply_queue = f"reply.{self.agent_id}"
         cap_queue = f"cap.{to_capability}"
 
         last_error: Optional[Exception] = None
-        total_attempts = 1 + self.max_retries
+        total_attempts = 1 + retries
 
         for attempt in range(total_attempts):
             request_envelope = self._build_envelope(
@@ -173,32 +188,15 @@ class MessageBus:
 
             reply = await self._poll_reply(reply_queue, correlation_id, attempt_deadline)
             if reply is not None:
-                reply_type = reply.get("type")
-                if reply_type == "reject":
-                    reject_payload = reply.get("payload") or {}
-                    retryable = bool(reject_payload.get("retryable", False))
-                    code = reject_payload.get("code", RejectCode.INTERNAL_ERROR.value)
-                    details = reject_payload.get("details", "Request rejected")
-                    last_error = Reject(code=code, details=details, retryable=retryable)
-                    if retryable and attempt < self.max_retries:
-                        backoff = self.RETRY_BACKOFFS_S[min(attempt, len(self.RETRY_BACKOFFS_S) - 1)]
-                        log_event(
-                            "BUS_REQUEST_RETRY",
-                            f"bus:{self.agent_id}",
-                            correlation_id=correlation_id,
-                            backoff_s=backoff,
-                            reason=code,
-                        )
-                        await asyncio.sleep(backoff)
-                        continue
-                    return reply
+                # Toda respuesta recibida (response o reject) se retorna tal cual:
+                # el reintento con la misma idempotency_key lo decide la capa superior.
                 return reply
 
             last_error = PlatformError(
                 "REQUEST_TIMEOUT",
                 f"Timeout ({effective_timeout}s) esperando respuesta para '{to_capability}'",
             )
-            if attempt < self.max_retries:
+            if attempt < retries:
                 backoff = self.RETRY_BACKOFFS_S[min(attempt, len(self.RETRY_BACKOFFS_S) - 1)]
                 log_event(
                     "BUS_REQUEST_RETRY",
@@ -219,10 +217,10 @@ class MessageBus:
         request_envelope: Dict[str, Any],
         msg_type: str,
         payload: Dict[str, Any],
-    ) -> None:
+    ) -> Optional[Dict[str, Any]]:
         reply_to = request_envelope.get("reply_to")
         if not reply_to:
-            return
+            return None
         reply_envelope = self._build_envelope(
             msg_type,
             payload,
@@ -236,6 +234,7 @@ class MessageBus:
             timeout_ms=None,
         )
         await self.broker.publish(reply_to, reply_envelope)
+        return reply_envelope
 
     async def _process_item(
         self,
@@ -296,6 +295,33 @@ class MessageBus:
             )
             return
 
+        # Misma idempotency_key ya en ejecución: esperar ese resultado en vez de ejecutar de nuevo
+        running = self._in_progress.get(idem_key) if idem_key else None
+        if running is not None:
+            shared = await asyncio.shield(running)
+            if shared is not None:
+                if envelope.get("reply_to"):
+                    reply_to_send = dict(shared)
+                    reply_to_send["correlation_id"] = correlation_id
+                    await self.broker.publish(envelope["reply_to"], reply_to_send)
+                if delivery_id:
+                    await self.broker.ack(queue, delivery_id)
+                log_event(
+                    "BUS_IDEMPOTENCY_HIT",
+                    f"bus:{self.agent_id}",
+                    correlation_id=correlation_id,
+                    idempotency_key=idem_key,
+                )
+            elif delivery_id:
+                await self.broker.nack(queue, delivery_id)
+            return
+
+        in_progress_future = None
+        if idem_key:
+            in_progress_future = asyncio.get_running_loop().create_future()
+            self._in_progress[idem_key] = in_progress_future
+
+        shared_reply: Optional[Dict[str, Any]] = None
         self._in_flight += 1
         try:
             result_payload = await handler(capability_id, envelope.get("payload") or {}, envelope)
@@ -312,6 +338,7 @@ class MessageBus:
                 timeout_ms=None,
             )
             self._store_cached_reply(idem_key, reply_env)
+            shared_reply = reply_env
             if envelope.get("reply_to"):
                 await self.broker.publish(envelope["reply_to"], reply_env)
             if delivery_id:
@@ -334,7 +361,10 @@ class MessageBus:
                 step_id=envelope.get("step_id"),
                 timeout_ms=None,
             )
-            self._store_cached_reply(idem_key, reject_env)
+            if not rej.retryable:
+                # un reject reintentable no se cachea: el reintento con la misma clave debe poder ejecutarse
+                self._store_cached_reply(idem_key, reject_env)
+            shared_reply = reject_env
             if envelope.get("reply_to"):
                 await self.broker.publish(envelope["reply_to"], reject_env)
             if delivery_id:
@@ -345,11 +375,22 @@ class MessageBus:
                 "details": str(exc),
                 "retryable": False,
             }
-            await self._publish_reply(envelope, "reject", reject_payload)
-            if delivery_id:
-                await self.broker.nack(queue, delivery_id)
+            try:
+                shared_reply = await self._publish_reply(envelope, "reject", reject_payload)
+            except Exception as publish_exc:
+                # solo se hace nack si no se pudo publicar la respuesta; si no, se haría reentrega y re-ejecución
+                log_event("BUS_REPLY_PUBLISH_ERROR", f"bus:{self.agent_id}", correlation_id=correlation_id, error=str(publish_exc))
+                if delivery_id:
+                    await self.broker.nack(queue, delivery_id)
+            else:
+                if delivery_id:
+                    await self.broker.ack(queue, delivery_id)
         finally:
             self._in_flight = max(0, self._in_flight - 1)
+            if in_progress_future is not None:
+                self._in_progress.pop(idem_key, None)
+                if not in_progress_future.done():
+                    in_progress_future.set_result(shared_reply)
 
     async def serve(
         self,

@@ -64,23 +64,18 @@ async def test_three_step_task_advances_to_completed_with_fake_registry(tmp_path
     service = OrchestratorService(db_path=db_file, registry=registry)
     task_id = await service.create_task(
         workflow="workflow.echo_math",
-        input_data={"text": "ds", "a": 2, "b": 5, "factor": 3},
+        # El workflow encadena: math.mul ← {"a": "$steps.1.result", "b": "$input.k"}
+        # por eso el input debe exponer 'k' (7 * 3 = 21)
+        input_data={"text": "ds", "a": 2, "b": 5, "k": 3},
     )
 
     def fake_executor(capability_id: str, step_input: dict, step: dict) -> dict:
         if capability_id == "echo.text":
-            return {
-                "echoed": step_input.get("text", ""),
-                "a": step_input.get("a", 0),
-                "b": step_input.get("b", 0),
-                "factor": step_input.get("factor", 1),
-            }
+            return {"echoed": step_input.get("text", "")}
         if capability_id == "math.add":
-            total = step_input.get("a", 0) + step_input.get("b", 0)
-            return {"sum": total, "factor": step_input.get("factor", 1)}
+            return {"result": step_input.get("a", 0) + step_input.get("b", 0)}
         if capability_id == "math.mul":
-            product = step_input.get("sum", 0) * step_input.get("factor", 1)
-            return {"result": product}
+            return {"result": step_input.get("a", 0) * step_input.get("b", 0)}
         raise ValueError(f"Capacidad desconocida: {capability_id}")
 
     final_task = await service.run_task_with_fakes(task_id, step_executor=fake_executor)

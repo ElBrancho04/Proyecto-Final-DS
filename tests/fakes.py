@@ -13,7 +13,8 @@ class FakeRegistry:
     async def discover(self, query: DiscoverQuery) -> List[Match]:
         matches = []
         for reg in self.registrations:
-            if reg["capability"].capability_id == query.capability_id:
+            # DiscoverQuery expone el campo 'capability' (no 'capability_id')
+            if reg["capability"].capability_id == query.capability:
                 matches.append(Match(
                     agent_id=reg["agent_id"],
                     instance_id=reg["instance_id"],
