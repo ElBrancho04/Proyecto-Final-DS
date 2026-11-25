@@ -1,7 +1,7 @@
 import asyncio
 import pytest
 from broker.store import BrokerStore
-from common.errors import Reject
+from common.errors import PlatformError, Reject
 from common.messages import RejectCode
 from sdk.messaging import MessageBus
 
@@ -55,7 +55,8 @@ async def test_message_bus_echo_request_response():
 
 
 @pytest.mark.asyncio
-async def test_message_bus_retries_with_same_idempotency_key():
+async def test_message_bus_retries_retryable_reject_with_same_idempotency_key():
+    """Un reject retryable se reintenta con backoff y la MISMA idempotency_key hasta obtener respuesta."""
     broker = InMemoryAsyncBroker()
     client_bus = MessageBus("agent-caller", broker)
     client_bus.RETRY_BACKOFFS_S = (0.01, 0.02, 0.03)
@@ -76,22 +77,104 @@ async def test_message_bus_retries_with_same_idempotency_key():
     server_task = asyncio.create_task(server_bus.serve("work.flaky", flaky_handler, max_concurrency=5))
     try:
         fixed_idem = "idem-fixed-123"
-        # El reject (aun siendo retryable) se retorna tal cual al llamador con la misma
-        # idempotency_key: el handler NO se re-ejecuta; quien decide reintentar es la capa superior.
         reply = await client_bus.send_request(
             "work.flaky",
             {"value": 42},
             timeout_s=2.0,
             idempotency_key=fixed_idem,
         )
-        assert reply["type"] == "reject"
-        assert reply["idempotency_key"] == fixed_idem
-        assert reply["payload"]["code"] == RejectCode.OVERLOADED.value
-        assert calls == 1
-        assert seen_keys == [fixed_idem]
+        assert reply["type"] == "response"
+        assert reply["payload"] == {"ok": True, "attempt": 2}
+        assert calls == 2
+        assert seen_keys == [fixed_idem, fixed_idem]
     finally:
         server_task.cancel()
         await asyncio.gather(server_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_message_bus_returns_last_reject_after_retries_exhausted():
+    """Agotados los reintentos con rejects retryables se devuelve el ÚLTIMO reject (nunca REQUEST_FAILED)."""
+    broker = InMemoryAsyncBroker()
+    client_bus = MessageBus("agent-caller", broker)
+    client_bus.RETRY_BACKOFFS_S = (0.01, 0.02, 0.03)
+    server_bus = MessageBus("agent-overloaded", broker)
+    server_bus.POLL_INTERVAL_S = 0.01
+
+    calls = 0
+    seen_keys = []
+
+    async def always_overloaded(capability_id: str, payload: dict, envelope: dict) -> dict:
+        nonlocal calls
+        calls += 1
+        seen_keys.append(envelope["idempotency_key"])
+        raise Reject(code=RejectCode.OVERLOADED.value, details="busy", retryable=True)
+
+    server_task = asyncio.create_task(server_bus.serve("work.busy", always_overloaded, max_concurrency=5))
+    try:
+        reply = await client_bus.send_request(
+            "work.busy",
+            {"value": 1},
+            timeout_s=2.0,
+            idempotency_key="idem-busy",
+        )
+        assert reply["type"] == "reject"
+        assert reply["payload"]["code"] == RejectCode.OVERLOADED.value
+        assert reply["payload"]["retryable"] is True
+        # 1 intento original + 3 reintentos del bus, todos con la misma idempotency_key
+        assert calls == 4
+        assert seen_keys == ["idem-busy"] * 4
+    finally:
+        server_task.cancel()
+        await asyncio.gather(server_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_message_bus_non_retryable_reject_returns_without_resend():
+    """Un reject no retryable se devuelve en el primer intento sin reenviar."""
+    broker = InMemoryAsyncBroker()
+    client_bus = MessageBus("agent-caller", broker)
+    client_bus.RETRY_BACKOFFS_S = (0.01, 0.02, 0.03)
+    server_bus = MessageBus("agent-invalid", broker)
+    server_bus.POLL_INTERVAL_S = 0.01
+
+    calls = 0
+
+    async def invalid_handler(capability_id: str, payload: dict, envelope: dict) -> dict:
+        nonlocal calls
+        calls += 1
+        raise Reject(code=RejectCode.VALIDATION_ERROR.value, details="bad payload")
+
+    server_task = asyncio.create_task(server_bus.serve("work.invalid", invalid_handler, max_concurrency=5))
+    try:
+        reply = await client_bus.send_request(
+            "work.invalid",
+            {"value": 1},
+            timeout_s=2.0,
+            idempotency_key="idem-invalid",
+        )
+        assert reply["type"] == "reject"
+        assert reply["payload"]["code"] == RejectCode.VALIDATION_ERROR.value
+        assert reply["payload"]["retryable"] is False
+        assert calls == 1
+    finally:
+        server_task.cancel()
+        await asyncio.gather(server_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_message_bus_request_failed_only_when_no_attempt_replies():
+    """REQUEST_FAILED solo cuando ningún intento obtuvo respuesta (timeout en todos)."""
+    broker = InMemoryAsyncBroker()
+    client_bus = MessageBus("agent-caller", broker)
+    client_bus.RETRY_BACKOFFS_S = (0.01, 0.01, 0.01)
+
+    with pytest.raises(PlatformError) as exc_info:
+        await client_bus.send_request("nobody.home", {"x": 1}, timeout_s=0.1)
+    assert exc_info.value.code == "REQUEST_FAILED"
+    # 1 intento original + 3 reintentos del bus = 4 mensajes publicados
+    published = broker._store.list_messages(limit=10, queue="cap.nobody.home")
+    assert len(published) == 4
 
 
 @pytest.mark.asyncio

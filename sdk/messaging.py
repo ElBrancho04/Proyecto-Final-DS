@@ -4,7 +4,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 from common.errors import PlatformError, Reject
 from common.ids import new_id
 from common.logging import log_event
-from common.messages import RejectCode, create_envelope
+from common.messages import DEFAULT_RETRYABLE, RejectCode, create_envelope
 
 HandlerFunc = Callable[[str, Dict[str, Any], Dict[str, Any]], Awaitable[Dict[str, Any]]]
 
@@ -134,6 +134,19 @@ class MessageBus:
 
         return None
 
+    @staticmethod
+    def _is_retryable_reject(reply_envelope: Dict[str, Any]) -> bool:
+        """Indica si un envelope de tipo reject debe reintentarse.
+
+        Usa el campo 'retryable' del payload; si falta, aplica DEFAULT_RETRYABLE[code].
+        """
+        payload = reply_envelope.get("payload") or {}
+        code = payload.get("code")
+        retryable = payload.get("retryable")
+        if retryable is None:
+            retryable = DEFAULT_RETRYABLE.get(code, False)
+        return bool(retryable)
+
     async def send_request(
         self,
         to_capability: str,
@@ -147,10 +160,8 @@ class MessageBus:
     ) -> Dict[str, Any]:
         """Envía un request a cap.{to_capability} y espera response/reject en reply.{agent_id}.
 
-        Los reintentos automáticos (backoff creciente, misma idempotency_key) aplican solo
-        cuando no llega respuesta (timeout). Los rejects se devuelven tal cual al llamador,
-        dejando la decisión de reintentar a la capa superior (p. ej. el orquestador).
-        max_retries sobrescribe el valor del bus (max_retries=0 desactiva los reintentos).
+        Garantía de retorno: siempre devuelve un Envelope (response | reject);
+        REQUEST_FAILED solo se lanza cuando ningún intento obtuvo respuesta.
         """
         retries = self.max_retries if max_retries is None else max_retries
         effective_timeout = timeout_s if timeout_s is not None else self.default_timeout_s
@@ -158,6 +169,7 @@ class MessageBus:
         reply_queue = f"reply.{self.agent_id}"
         cap_queue = f"cap.{to_capability}"
 
+        last_reject: Optional[Dict[str, Any]] = None
         last_error: Optional[Exception] = None
         total_attempts = 1 + retries
 
@@ -188,8 +200,21 @@ class MessageBus:
 
             reply = await self._poll_reply(reply_queue, correlation_id, attempt_deadline)
             if reply is not None:
-                # Toda respuesta recibida (response o reject) se retorna tal cual:
-                # el reintento con la misma idempotency_key lo decide la capa superior.
+                if reply.get("type") == "reject" and self._is_retryable_reject(reply):
+                    # Reject retryable: se recuerda el último recibido y se reintenta con backoff
+                    last_reject = reply
+                    if attempt < retries:
+                        backoff = self.RETRY_BACKOFFS_S[min(attempt, len(self.RETRY_BACKOFFS_S) - 1)]
+                        log_event(
+                            "BUS_REQUEST_RETRY",
+                            f"bus:{self.agent_id}",
+                            correlation_id=correlation_id,
+                            backoff_s=backoff,
+                            reason="REJECT_RETRYABLE",
+                        )
+                        await asyncio.sleep(backoff)
+                    continue
+                # response, o reject no retryable: se devuelve tal cual sin reenviar
                 return reply
 
             last_error = PlatformError(
@@ -206,6 +231,18 @@ class MessageBus:
                     reason="TIMEOUT",
                 )
                 await asyncio.sleep(backoff)
+
+        if last_reject is not None:
+            # Agotados los reintentos con rejects retryables: se devuelve el último reject recibido
+            log_event(
+                "BUS_REQUEST_REJECT_EXHAUSTED",
+                f"bus:{self.agent_id}",
+                correlation_id=last_reject.get("correlation_id", "N/A"),
+                capability=to_capability,
+                attempts=total_attempts,
+                idempotency_key=idem_key,
+            )
+            return last_reject
 
         raise PlatformError(
             "REQUEST_FAILED",
@@ -362,7 +399,8 @@ class MessageBus:
                 timeout_ms=None,
             )
             if not rej.retryable:
-                # un reject reintentable no se cachea: el reintento con la misma clave debe poder ejecutarse
+                # Solo se cachean los rejects NO retryables: un reject retryable debe
+                # poder ejecutarse de nuevo en el reintento con la misma clave.
                 self._store_cached_reply(idem_key, reject_env)
             shared_reply = reject_env
             if envelope.get("reply_to"):
