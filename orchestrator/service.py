@@ -1,12 +1,15 @@
 import asyncio
 import os
-from typing import Any, Callable, Dict, List, Optional
+import time
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import ray
 
 from common.config import RAY_NAMESPACE
-from common.errors import PlatformError
+from common.errors import PlatformError, Reject
 from common.logging import log_event
 from common.models import DiscoverQuery
+from orchestrator.executor import BusStepExecutor
 from orchestrator.state_machine import (
     StepState,
     TERMINAL_TASK_STATES,
@@ -16,25 +19,42 @@ from orchestrator.state_machine import (
 )
 from orchestrator.store import OrchestratorStore
 from orchestrator.workflows import resolve_input_map, resolve_steps
+from sdk.messaging import MessageBus
 
 
 class OrchestratorService:
     """
-    Núcleo del Orquestador: gestiona tareas, pasos e historial append-only en SQLite.
-    Todo el estado vive en SQLite; el servicio es stateless respecto al estado de las tareas.
+    Núcleo del Orquestador: gestiona tareas, pasos e historial append-only en SQLite
+    y ejecuta los pasos contra agentes reales a través del MessageBus.
+
+    Todo el estado vive en SQLite. advance_step ejecuta un único intento de paso;
+    los reintentos con backoff corren en run_pending_tasks, y la reasignación de
+    pasos interrumpidos se hace en recover_pending_tasks al arrancar el actor.
     """
 
     MAX_STEP_ATTEMPTS = 3
+    STEP_RETRY_BACKOFFS_S: Tuple[float, ...] = (1.0, 2.0, 4.0)
 
     def __init__(
         self,
         db_path: str = "data/orchestrator.db",
         registry: Any = None,
         broker: Any = None,
+        step_timeout_s: float = 10.0,
     ) -> None:
         self.store = OrchestratorStore(db_path=db_path)
         self.registry = registry
         self.broker = broker
+        self.default_executor: Optional[BusStepExecutor]
+        if broker is not None:
+            bus = MessageBus("orchestrator", broker)
+            self.default_executor = BusStepExecutor(bus, timeout_s=step_timeout_s)
+        else:
+            self.default_executor = None
+
+    def _utcnow(self) -> datetime:
+        """Reloj del servicio; los tests lo sustituyen para controlar el backoff."""
+        return datetime.now(timezone.utc)
 
     async def health(self) -> Dict[str, Any]:
         tasks = self.store.list_tasks()
@@ -105,8 +125,9 @@ class OrchestratorService:
 
     async def recover_pending_tasks(self) -> List[str]:
         """
-        Recuperación al arrancar: los pasos que quedaron RUNNING vuelven a PENDING (misma idempotency_key)
-        y se devuelven los ids de las tareas no terminales que deben reanudarse.
+        Recuperación al arrancar: los pasos que quedaron RUNNING vuelven a PENDING
+        (misma idempotency_key) y se devuelven los ids de las tareas no terminales
+        que deben reanudarse.
         """
         resumable: List[str] = []
         for task in self.store.list_tasks():
@@ -132,16 +153,73 @@ class OrchestratorService:
         return resumable
 
     async def _discover_capability(self, capability_id: str) -> List[Any]:
-        """Consulta el registro (o FakeRegistry) para descubrir instancias de una capacidad."""
+        """Consulta el registro y devuelve solo las instancias con lease vigente."""
         if self.registry is None:
             return []
         query = DiscoverQuery(capability=capability_id)
         if hasattr(self.registry, "discover"):
             res = self.registry.discover(query)
-            if asyncio.iscoroutine(res):
-                return await res
-            return res
+            matches = await res if asyncio.iscoroutine(res) else res
+            now = time.time()
+            return [m for m in matches if getattr(m, "lease_expires_at", 0) > now]
         return []
+
+    @staticmethod
+    def _is_retryable_error(exc: Exception) -> bool:
+        """Un reject decide por su marca; VALIDATION_ERROR nunca se reintenta; el resto de errores sí."""
+        if isinstance(exc, Reject):
+            return exc.retryable
+        if isinstance(exc, PlatformError):
+            return exc.code != "VALIDATION_ERROR"
+        return True
+
+    def _step_backoff_elapsed(self, step: Dict[str, Any]) -> bool:
+        """Indica si un paso pendiente con intentos previos ya cumplió el backoff de su último intento."""
+        attempt = step.get("attempt", 0)
+        if attempt <= 0:
+            return True
+        backoff = self.STEP_RETRY_BACKOFFS_S[min(attempt - 1, len(self.STEP_RETRY_BACKOFFS_S) - 1)]
+        if backoff <= 0:
+            return True
+        try:
+            updated_at = datetime.fromisoformat(step["updated_at"])
+        except (KeyError, TypeError, ValueError):
+            return True
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        return (self._utcnow() - updated_at).total_seconds() >= backoff
+
+    async def run_pending_tasks(self) -> Dict[str, int]:
+        """
+        Ejecuta una pasada sobre las tareas no terminales.
+
+        Por cada tarea con un paso pendiente lo ejecuta con el ejecutor real; un paso
+        con intentos previos solo se ejecuta cuando transcurrió el backoff de su último
+        intento (calculado contra updated_at en SQLite) y, mientras espera, se difiere
+        sin bloquear al resto de tareas.
+        """
+        summary = {"executed": 0, "deferred": 0}
+        for task in self.store.list_tasks():
+            if task["state"] in TERMINAL_TASK_STATES:
+                continue
+            next_step = next(
+                (s for s in task["steps"] if s["state"] == StepState.PENDING.value),
+                None,
+            )
+            if next_step is None:
+                continue
+            if any(
+                s["state"] != StepState.DONE.value
+                for s in task["steps"][: next_step["step_index"]]
+            ):
+                # Paso previo sin completar (residuo RUNNING tras una caída): lo reasigna recover_pending_tasks
+                continue
+            if not self._step_backoff_elapsed(next_step):
+                summary["deferred"] += 1
+                continue
+            await self.advance_step(task_id=task["task_id"])
+            summary["executed"] += 1
+        return summary
 
     async def advance_step(
         self,
@@ -149,9 +227,15 @@ class OrchestratorService:
         step_executor: Optional[Callable[[str, Dict[str, Any], Dict[str, Any]], Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Avanza el siguiente paso pendiente de una tarea, persistiendo estado, salidas y
-        eventos append-only en SQLite.
+        Ejecuta el siguiente paso pendiente de una tarea como un único intento,
+        persistiendo estado, salida y eventos en SQLite.
+
+        step_executor permite inyectar un ejecutor de prueba; por defecto se usa el
+        ejecutor real sobre el MessageBus. Sin ejecutor disponible lanza
+        EXECUTOR_NOT_CONFIGURED.
         """
+        executor = step_executor if step_executor is not None else self.default_executor
+
         task = self.store.get_task(task_id)
         if task["state"] in TERMINAL_TASK_STATES:
             return task
@@ -183,15 +267,6 @@ class OrchestratorService:
         capability_id = next_step["capability_id"]
         attempt = next_step["attempt"] + 1
 
-        # Si el paso está en estado RUNNING desde un intento previo, devolver a PENDING antes de re-ejecutar
-        if next_step["state"] == StepState.RUNNING.value:
-            transition_step(next_step, StepState.PENDING.value)
-            self.store.update_step(step_id, state=StepState.PENDING.value)
-            next_step = self.store.get_task(task_id)["steps"][next_step["step_index"]]
-
-        matches = await self._discover_capability(capability_id)
-        selected_match = matches[0] if matches else None
-
         transition_step(next_step, StepState.RUNNING.value)
         event_type = "STEP_STARTED" if attempt == 1 else "STEP_REASSIGNED"
         self.store.update_step(
@@ -205,11 +280,10 @@ class OrchestratorService:
                 "capability_id": capability_id,
                 "attempt": attempt,
                 "idempotency_key": next_step["idempotency_key"],
-                "target_agent_id": getattr(selected_match, "agent_id", None),
             },
         )
 
-        # Preparar entrada del paso: si tiene input propio no vacío lo usa; si no, encadena output previo o input de tarea
+        # Entrada del paso: si tiene input propio no vacío lo usa; si no, encadena output previo o input de tarea
         task_now = self.store.get_task(task_id)
         current_step = next(s for s in task_now["steps"] if s["step_id"] == step_id)
         step_input = dict(current_step["input"]) if current_step["input"] else {}
@@ -222,6 +296,18 @@ class OrchestratorService:
             self.store.update_step(step_id, input_data=step_input)
 
         try:
+            if executor is None:
+                raise PlatformError("EXECUTOR_NOT_CONFIGURED", "No hay ejecutor de pasos configurado")
+
+            candidates = await self._discover_capability(capability_id)
+            # El requisito de instancia viva aplica al ejecutor real; un ejecutor
+            # inyectado simula el agente directamente y no pasa por el registro.
+            if step_executor is None and not candidates:
+                raise PlatformError(
+                    "UNAVAILABLE",
+                    f"No hay instancias vivas para la capacidad '{capability_id}'",
+                )
+
             if current_step.get("input_map"):
                 step_input = resolve_input_map(
                     current_step["input_map"],
@@ -230,12 +316,9 @@ class OrchestratorService:
                 )
                 self.store.update_step(step_id, input_data=step_input)
 
-            if step_executor is not None:
-                raw_result = step_executor(capability_id, step_input, current_step)
-                step_output = await raw_result if asyncio.iscoroutine(raw_result) else raw_result
-            else:
-                # Nunca se marca un paso como DONE sin respuesta real de un agente
-                raise PlatformError("EXECUTOR_NOT_CONFIGURED", "No hay ejecutor de pasos configurado")
+            # Nunca se marca un paso como DONE sin respuesta real de un agente
+            raw_result = executor(capability_id, step_input, current_step)
+            step_output = await raw_result if asyncio.iscoroutine(raw_result) else raw_result
 
             transition_step(current_step, StepState.DONE.value, {"output": step_output})
             self.store.update_step(
@@ -249,6 +332,7 @@ class OrchestratorService:
                     "capability_id": capability_id,
                     "attempt": attempt,
                     "output": step_output,
+                    "candidate_agent_id": getattr(candidates[0], "agent_id", None) if candidates else None,
                 },
             )
 
@@ -273,8 +357,7 @@ class OrchestratorService:
 
         except Exception as exc:
             err_info = {"error": str(exc), "attempt": attempt}
-            non_retryable = isinstance(exc, PlatformError) and exc.code == "VALIDATION_ERROR"
-            if attempt < self.MAX_STEP_ATTEMPTS and not non_retryable:
+            if attempt < self.MAX_STEP_ATTEMPTS and self._is_retryable_error(exc):
                 transition_step(current_step, StepState.PENDING.value)
                 self.store.update_step(
                     step_id,
@@ -314,7 +397,7 @@ class OrchestratorService:
         step_executor: Optional[Callable[[str, Dict[str, Any], Dict[str, Any]], Any]] = None,
         max_iterations: int = 25,
     ) -> Dict[str, Any]:
-        """Ejecuta secuencialmente los pasos de una tarea contra fakes hasta estado terminal."""
+        """Ejecuta secuencialmente los pasos de una tarea contra un ejecutor inyectado hasta estado terminal."""
         for _ in range(max_iterations):
             task = self.store.get_task(task_id)
             if task["state"] in TERMINAL_TASK_STATES:
@@ -333,17 +416,58 @@ class OrchestratorService:
 class OrchestratorActor:
     """Actor de Ray para el Orquestador."""
 
-    def __init__(self, db_path: str = "data/orchestrator.db", registry: Any = None, broker: Any = None) -> None:
-        self._service = OrchestratorService(db_path=db_path, registry=registry, broker=broker)
+    TICK_S = 1.0
+
+    def __init__(
+        self,
+        db_path: str = "data/orchestrator.db",
+        registry: Any = None,
+        broker: Any = None,
+        step_timeout_s: float = 10.0,
+    ) -> None:
+        self._service = OrchestratorService(
+            db_path=db_path,
+            registry=registry,
+            broker=broker,
+            step_timeout_s=step_timeout_s,
+        )
+        self._loop_task: Optional[asyncio.Task] = None
+
+    async def _task_loop(self) -> None:
+        while True:
+            try:
+                await self._service.run_pending_tasks()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log_event("ORCHESTRATOR_LOOP_ERROR", "orchestrator", error=str(exc))
+            await asyncio.sleep(self.TICK_S)
 
     async def start(self) -> List[str]:
-        return await self._service.recover_pending_tasks()
+        """Recupera los pasos interrumpidos y arranca el bucle de ejecución de tareas."""
+        resumable = await self._service.recover_pending_tasks()
+        if self._loop_task is None or self._loop_task.done():
+            self._loop_task = asyncio.create_task(self._task_loop())
+            log_event("ORCHESTRATOR_LOOP_STARTED", "orchestrator", resumed_tasks=len(resumable))
+        return resumable
+
+    async def stop(self) -> None:
+        """Detiene el bucle de ejecución de tareas."""
+        if self._loop_task is not None:
+            self._loop_task.cancel()
+            try:
+                await self._loop_task
+            except asyncio.CancelledError:
+                pass
+            self._loop_task = None
+        log_event("ORCHESTRATOR_LOOP_STOPPED", "orchestrator")
 
     async def health(self) -> Dict[str, Any]:
         return {
             **await self._service.health(),
             "pid": os.getpid(),
             "node_id": ray.get_runtime_context().get_node_id(),
+            "loop_running": self._loop_task is not None and not self._loop_task.done(),
         }
 
     async def create_task(

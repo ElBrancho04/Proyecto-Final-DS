@@ -1,5 +1,8 @@
 from typing import Dict, Any, List, Optional
+
+from broker.store import BrokerStore
 from common.models import CapabilitySpec, DiscoverQuery, Match
+
 
 class FakeRegistry:
     def __init__(self):
@@ -27,6 +30,7 @@ class FakeRegistry:
     async def health(self) -> Dict[str, Any]:
         return {"node": "fake_registry", "entries": len(self.registrations), "alive": True}
 
+
 class FakeBroker:
     def __init__(self):
         self.queues: Dict[str, List[dict]] = {}
@@ -50,3 +54,28 @@ class FakeBroker:
 
     async def health(self) -> Dict[str, Any]:
         return {"status": "healthy", "queues": list(self.queues.keys())}
+
+
+class InMemoryAsyncBroker:
+    """Broker real sobre SQLite en memoria con la interfaz async del broker.
+
+    Mantiene el comportamiento del broker real (visibility timeout, attempts, DLQ)
+    sin Ray; el store queda expuesto para que los tests inspeccionen colas y mensajes.
+    """
+
+    def __init__(self, visibility_timeout: int = 30, max_attempts: int = 3) -> None:
+        self.store = BrokerStore(db_path=":memory:")
+        self.visibility_timeout = visibility_timeout
+        self.max_attempts = max_attempts
+
+    async def publish(self, queue: str, envelope: dict) -> str:
+        return self.store.publish(queue, envelope)
+
+    async def consume(self, queue: str) -> Optional[Dict[str, Any]]:
+        return self.store.consume(queue, visibility_timeout=self.visibility_timeout)
+
+    async def ack(self, queue: str, delivery_id: str) -> None:
+        self.store.ack(queue, delivery_id)
+
+    async def nack(self, queue: str, delivery_id: str) -> None:
+        self.store.nack(queue, delivery_id, max_attempts=self.max_attempts)
