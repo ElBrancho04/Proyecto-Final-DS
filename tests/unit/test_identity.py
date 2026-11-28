@@ -40,7 +40,7 @@ def test_jwt_default_scopes():
 def test_jwt_wrong_secret_rejected():
     token = issue_jwt("agent-1", SECRET)
     with pytest.raises(PlatformError) as exc:
-        verify_jwt(token, "other-secret")
+        verify_jwt(token, "other-secret-32-bytes-for-hs256-rfc7518")
     assert exc.value.code == "AUTH_ERROR"
 
 
